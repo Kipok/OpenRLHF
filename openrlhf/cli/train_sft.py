@@ -112,7 +112,7 @@ def train(args):
     if args.load_checkpoint and os.path.exists(args.ckpt_path):
         _, states = strategy.load_ckpt(model.model, args.ckpt_path)
         consumed_samples = states["consumed_samples"]
-        strategy.args.wandb_id = states["wandb_id"]
+        strategy.args.wandb_id = states.get("wandb_id", strategy.args.wandb_id)
         strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
 
     os.makedirs(args.save_path, exist_ok=True)
