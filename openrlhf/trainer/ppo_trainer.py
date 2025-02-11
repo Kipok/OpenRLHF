@@ -164,7 +164,7 @@ class PPOTrainer(ABC):
             self._wandb = wandb
             if not wandb.api.api_key:
                 wandb.login(key=strategy.args.use_wandb)
-            wandb.init(
+            run = wandb.init(
                 entity=strategy.args.wandb_org,
                 project=strategy.args.wandb_project,
                 id=strategy.args.wandb_id,
@@ -174,6 +174,7 @@ class PPOTrainer(ABC):
                 config=strategy.args.__dict__,
                 reinit=True,
             )
+            self.strategy.args.wandb_id = run.id
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
@@ -251,7 +252,10 @@ class PPOTrainer(ABC):
                 pbar.set_postfix(status)
 
                 # logs/checkpoints
-                client_states = {"consumed_samples": steps * args.rollout_batch_size}
+                client_states = {
+                    "consumed_samples": steps * args.rollout_batch_size,
+                    "wandb_id": self._wandb_run_id
+                }
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
 
                 pbar.update()

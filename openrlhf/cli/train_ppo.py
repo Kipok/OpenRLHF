@@ -221,6 +221,7 @@ def train(args):
         if args.critic_pretrain:
             strategy.load_ckpt(critic, os.path.join(args.ckpt_path, "_critic"))
         consumed_samples = states["consumed_samples"]
+        strategy.args.wandb_id = states["wandb_id"]
         strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
 
     os.makedirs(args.save_path, exist_ok=True)

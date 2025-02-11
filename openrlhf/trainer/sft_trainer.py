@@ -80,7 +80,7 @@ class SFTTrainer(ABC):
             self._wandb = wandb
             if not wandb.api.api_key:
                 wandb.login(key=strategy.args.use_wandb)
-            wandb.init(
+            run = wandb.init(
                 entity=strategy.args.wandb_org,
                 project=strategy.args.wandb_project,
                 id=strategy.args.wandb_id,
@@ -90,6 +90,7 @@ class SFTTrainer(ABC):
                 config=strategy.args.__dict__,
                 reinit=True,
             )
+            self.strategy.args.wandb_id = run.id
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
@@ -214,7 +215,10 @@ class SFTTrainer(ABC):
                     logs_dict["loss_mean"] = loss_sum / self.strategy.accumulated_gradient
                     loss_sum = 0
                     global_step = step // self.strategy.accumulated_gradient
-                    client_states = {"consumed_samples": global_step * args.train_batch_size}
+                    client_states = {
+                        "consumed_samples": global_step * args.train_batch_size,
+                        "wandb_id": self.strategy.args.wandb_id
+                    }
                     self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
 
                 step += 1
