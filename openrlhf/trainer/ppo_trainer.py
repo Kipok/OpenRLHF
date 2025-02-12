@@ -1,6 +1,7 @@
 import os
 import os.path
 from abc import ABC
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -177,8 +178,8 @@ class PPOTrainer(ABC):
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
-            wandb.define_metric("eval/epoch")
-            wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            wandb.define_metric("eval/global_step")
+            wandb.define_metric("eval/*", step_metric="eval/global_step", step_sync=True)
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
@@ -195,6 +196,7 @@ class PPOTrainer(ABC):
         pretrain_dataloader,
         consumed_samples=0,
         num_update_steps_per_episodes=1,
+        eval_dataloader=None,
     ) -> None:
         num_rollouts_per_episodes = (
             num_update_steps_per_episodes
@@ -212,6 +214,7 @@ class PPOTrainer(ABC):
 
         self.prompts_dataloader = prompts_dataloader
         self.pretrain_dataloader = pretrain_dataloader
+        self.eval_dataloader = eval_dataloader
 
         # Restore step and start_epoch
         steps = consumed_samples // args.rollout_batch_size + 1
@@ -473,6 +476,27 @@ class PPOTrainer(ABC):
         }
         return status
 
+    def evaluate(self, dataloader, global_step):
+            eval_buffer = defaultdict(list)
+
+            pbar = tqdm(
+                range(dataloader.__len__()),
+                desc=f"Eval global step [{global_step}]",
+                disable=not self.strategy.is_rank_0(),
+            )
+
+            for prompts in dataloader:
+                for i, experience in enumerate(
+                    self.experience_maker.make_experience_list(prompts, **self.generate_kwargs)
+                ):
+                    eval_buffer['reward'].extend(experience.info['reward'])
+                    pbar.update()
+
+            logs_dict = {
+                'reward': torch.stack(eval_buffer['reward']).mean().item()
+            }
+            return logs_dict
+
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
             # wandb
@@ -495,15 +519,26 @@ class PPOTrainer(ABC):
                     for k, v in self.experience_maker.perf_stats.items():
                         self._tensorboard.add_scalar(f"perf/experience_maker/{k}", v, global_step)
 
-        # TODO: Add evaluation mechanism for PPO
-        if global_step % args.eval_steps == 0:
-            # self.evaluate(self.eval_dataloader, global_step)
-            pass
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
             self._save_checkpoint(args, tag, client_states)
+
+        # Run eval after check for checkpoint  save in case checkpoint save comes at the end of the job
+        if global_step % args.eval_steps == 0 and self.eval_dataloader is not None:
+            logs_dict = self.evaluate(self.eval_dataloader, global_step)
+            if self._wandb is not None and self.strategy.is_rank_0():
+                logs = {
+                    "eval/%s" % k: v
+                    for k, v in {
+                        **logs_dict,
+                        "global_step": global_step,
+                    }.items()
+                }
+                # if self.experience_maker.perf_stats is not None:
+                #     logs.update({f"perf/experience_maker/{k}": v for k, v in self.experience_maker.perf_stats.items()})
+                self._wandb.log(logs)
 
     def _save_checkpoint(self, args, tag, client_states):
         if not self.disable_ds_ckpt:

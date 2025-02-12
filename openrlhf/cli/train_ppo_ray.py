@@ -282,6 +282,7 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
     parser.add_argument("--micro_train_batch_size", type=int, default=4, help="batch size per GPU")
     parser.add_argument("--train_batch_size", type=int, default=128, help="Global training batch size")
+    parser.add_argument("--limit_val_batches", type=int, default=None, help="Number of batches of validation to run")
     parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normazation")
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -335,6 +336,13 @@ if __name__ == "__main__":
         help="sampling probs for datasets",
     )
     parser.add_argument("--prompt_split", type=str, default="train")
+    parser.add_argument("--eval_data", type=str, default=None, help="HF dataset name or path")
+    parser.add_argument(
+        "--eval_data_probs",
+        type=str,
+        default="1.0",
+        help="sampling probs for datasets",
+    )
     parser.add_argument("--pretrain_data", type=str, default=None, help="HF dataset name or path")
     parser.add_argument(
         "--pretrain_data_probs",
