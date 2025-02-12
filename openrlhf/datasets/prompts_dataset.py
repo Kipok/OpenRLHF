@@ -16,7 +16,6 @@ def preprocess_data(data, input_template=None, input_key="input", apply_chat_tem
             prompt = input_template.format(prompt)
     return prompt
 
-
 class PromptDataset(Dataset):
     """
     Dataset for PPO model
@@ -47,13 +46,12 @@ class PromptDataset(Dataset):
             apply_chat_template = self.tokenizer.apply_chat_template
 
         self.prompts = []
-        for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
+        self.prompt_metadata = []
+        for i, data in tqdm(enumerate(dataset), desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
             prompt = preprocess_data(data, input_template, input_key, apply_chat_template)
-            prompt_dict = {"_prompt": prompt}
-            prompt_dict.update(data)
-            # we are encoding back to string since DeepSeek handles dict data
-            # natively in some strange way which we want to avoid
-            prompt = json.dumps(prompt_dict)
+            data.pop(input_key)
+            data['_idx'] = i
+            self.prompt_metadata.append(data)
             self.prompts.append(prompt)
 
     def __len__(self):
@@ -61,4 +59,4 @@ class PromptDataset(Dataset):
         return length
 
     def __getitem__(self, idx):
-        return self.prompts[idx]
+        return self.prompts[idx], self.prompt_metadata[idx]

@@ -3,7 +3,7 @@ import time
 from abc import ABC
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import ray
 import torch
@@ -156,6 +156,7 @@ class NaiveExperienceMaker(ABC):
         if remote_rm_url and remote_rm_url[0].endswith(".py"):
             print(f"Loading custom `reward_func(queries, prompts)` from {remote_rm_url[0]}")
             import importlib.util
+            import inspect
 
             spec = importlib.util.spec_from_file_location("reward_func", remote_rm_url[0])
             reward_module = importlib.util.module_from_spec(spec)
@@ -183,7 +184,7 @@ class NaiveExperienceMaker(ABC):
         return {k: v.to(device) for k, v in batch.items()}
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, extra_rm_args, all_prompts: Union[Dict, List[Dict]], **generate_kwargs) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
@@ -202,7 +203,7 @@ class NaiveExperienceMaker(ABC):
             desc="make_experience",
             disable=not self.strategy.is_rank_0(),
         ):
-            experiences.append(self.make_experience(samples).to_device("cpu"))
+            experiences.append(self.make_experience(extra_rm_args, samples).to_device("cpu"))
 
         experiences, rewards = self.process_experiences(experiences)
 
@@ -257,6 +258,7 @@ class NaiveExperienceMaker(ABC):
         """
         Generate samples and return in batches.
         """
+        all_prompts, all_prompt_metadata = all_prompts
         assert not getattr(self, "packing_samples", False)
         args = self.strategy.args
         self.actor.eval()
@@ -264,13 +266,9 @@ class NaiveExperienceMaker(ABC):
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
         samples_list = []
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
+            prompt_metadata = all_prompt_metadata[i : i + args.micro_rollout_batch_size]
             prompts = all_prompts[i : i + args.micro_rollout_batch_size]
-            decoded_prompt_dicts = [json.loads(prompt) for prompt in prompts]
-            prompt_strings = [prompt_dict["_prompt"] for prompt_dict in decoded_prompt_dicts]
-            prompt_metadata = [prompt_dict for prompt_dict in decoded_prompt_dicts]
-            for prompt_dict in prompt_metadata:
-                prompt_dict.pop("_prompt")
-            inputs = self.tokenize_fn(prompt_strings, self.prompt_max_len, device="cuda")
+            inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
             sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
             samples = Samples(
                 sequences=sequences,
@@ -287,7 +285,7 @@ class NaiveExperienceMaker(ABC):
         return samples_list
 
     @torch.no_grad()
-    def make_experience(self, samples: Samples) -> Experience:
+    def make_experience(self, extra_rm_args, samples: Samples) -> Experience:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
@@ -322,7 +320,7 @@ class NaiveExperienceMaker(ABC):
             # remote RM
             queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
             if self.custom_reward_func:
-                r = self.custom_reward_func(queries, samples.prompts, samples.prompt_metadata).to(device=action_log_probs.device)
+                r = self.custom_reward_func(queries, samples.prompts, samples.prompt_metadata, **extra_rm_args).to(device=action_log_probs.device)
             else:
                 r = remote_rm_fn(self.remote_rm_url, queries=queries, prompts=samples.prompts).to(
                     device=action_log_probs.device
@@ -499,14 +497,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             self.custom_reward_func = ray.remote(self.custom_reward_func)
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, extra_rm_args, all_prompts: Union[Dict, List[Dict]], **generate_kwargs) -> List[Experience]:
         if self.strategy.args.perf:
             self.perf_stats = {
                 "generate_time": 0,
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(all_prompts, **generate_kwargs)
+        experiences = super().make_experience_list(extra_rm_args, all_prompts, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
@@ -516,7 +514,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[Dict], **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -529,7 +527,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return self._generate_vllm(all_prompts, **generate_kwargs)
 
     @torch.no_grad()
-    def make_experience(self, samples: Samples) -> Experience:
+    def make_experience(self, extra_rm_args, samples: Samples) -> Experience:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
@@ -591,7 +589,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
 
             if self.custom_reward_func:
-                r = self.custom_reward_func.remote(queries, samples.prompts, samples.prompt_metadata)
+                r = self.custom_reward_func.remote(queries, samples.prompts, samples.prompt_metadata, **extra_rm_args)
                 r_refs.append(r)
             else:
                 for rm in self.remote_rm_url:
@@ -678,9 +676,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.actor.train()  # reset model state
         return experience
 
-    def _generate_vllm(self, all_prompts: List[str], **kwargs) -> List[Samples]:
+    def _generate_vllm(self, all_prompts: List[Dict], **kwargs) -> List[Samples]:
         from vllm import SamplingParams
 
+        all_prompts, all_prompt_metadata = all_prompts
         # round-robin load balance
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -705,15 +704,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         # Expand prompt list based on the number of samples per prompt
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-
-        decoded_prompt_dicts = [json.loads(prompt) for prompt in all_prompts]
-        prompt_strings = [prompt_dict["_prompt"] for prompt_dict in decoded_prompt_dicts]
-        prompt_metadata = [prompt_dict for prompt_dict in decoded_prompt_dicts]
-        for prompt_dict in prompt_metadata:
-            prompt_dict.pop("_prompt")
-
-
-        all_prompt_token_ids = self.tokenize_fn(prompt_strings, self.prompt_max_len, padding=False)["input_ids"]
+        all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
         # Distribute requests to engines and collect responses to outputs
         all_output_refs = []
@@ -731,8 +722,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         samples_list = []
         for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
             outputs = all_outputs[i : i + self.strategy.args.micro_rollout_batch_size]
-            prompts = prompt_strings[i : i + self.strategy.args.micro_rollout_batch_size]
-            cur_metadata = prompt_metadata[i : i + self.strategy.args.micro_rollout_batch_size]
+            prompts = all_prompts[i : i + self.strategy.args.micro_rollout_batch_size]
+            cur_metadata = all_prompt_metadata[i : i + self.strategy.args.micro_rollout_batch_size]
             if not self.packing_samples:
                 # NOTE: concat all outputs to following format:
                 #

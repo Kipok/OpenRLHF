@@ -345,8 +345,13 @@ class ActorModelRayActor(BasePPORole):
         self.prompts_dataset = PromptDataset(
             prompts_data, self.tokenizer, strategy, input_template=args.input_template
         )
+
+        def custom_collate_fn(batch):
+            prompts, data = zip(*batch)
+            return list(prompts), list(data)
+
         self.prompts_dataloader = strategy.setup_dataloader(
-            self.prompts_dataset, args.rollout_batch_size // strategy.world_size, True, True
+            self.prompts_dataset, args.rollout_batch_size // strategy.world_size, True, True, collate_fn=custom_collate_fn,
         )
 
         if args.pretrain_data:
