@@ -123,3 +123,4 @@ def convert_token_to_id(token, tokenizer):
         return token[0]
     else:
         raise ValueError("token should be int or str")
+

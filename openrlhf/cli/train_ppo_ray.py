@@ -283,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normazation")
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--eval_temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--freezing_actor_steps", type=int, default=-1, help="Used for critic initialization")
     parser.add_argument(
@@ -330,7 +331,7 @@ if __name__ == "__main__":
         "--prompt_data_probs",
         type=str,
         default="1.0",
-        help="sampling probs for datasets",
+        help="sampling probs for datasets; comma separated list",
     )
     parser.add_argument("--prompt_split", type=str, default="train")
     parser.add_argument("--eval_data", type=str, default=None, help="HF dataset name or path")
@@ -338,7 +339,7 @@ if __name__ == "__main__":
         "--eval_data_probs",
         type=str,
         default="1.0",
-        help="sampling probs for datasets",
+        help="sampling probs for datasets; comma separated list",
     )
     parser.add_argument("--pretrain_data", type=str, default=None, help="HF dataset name or path")
     parser.add_argument(
@@ -374,7 +375,7 @@ if __name__ == "__main__":
     # performance tuning
     parser.add_argument("--perf", action="store_true", default=False)
 
-    parser.add_argument('--no_truncated_prompts', dest='truncated_prompts', action='store_false', default=True)
+    parser.add_argument('--no_truncated_prompts', dest='truncated_prompts', action='store_false', default=True, help="Filters out prompts whose length exceeds prompt_max_len and who would otherwise be truncated")
     parser.add_argument("--extra_rm_args", type=str, default="{}")
     parser.add_argument("--buffer_limit", type=int, default=0)
 
@@ -384,6 +385,7 @@ if __name__ == "__main__":
 
     print('Extra RM Args:')
     pprint(args.extra_rm_args)
+    print('eval_steps', args.eval_steps)
 
     if args.advantage_estimator not in ["gae"]:
         args.critic_pretrain = None
