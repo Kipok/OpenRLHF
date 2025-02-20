@@ -380,7 +380,11 @@ class ActorModelRayActor(BasePPORole):
                 eval_data = eval_data.select(range(min(samples_in_limited_batches, len(eval_data))))
 
             self.eval_dataset = PromptDataset(
-                eval_data, self.tokenizer, strategy, input_template=args.input_template
+                eval_data, 
+                self.tokenizer, 
+                strategy, 
+                input_template=args.input_template,
+                max_prompt_length=args.prompt_max_len if not args.truncated_prompts else None,
             )
             strategy.print(f'Number of samples in eval dataset: {len(self.eval_dataset)}')
             self.eval_dataloader = strategy.setup_dataloader(
@@ -488,6 +492,7 @@ class ActorModelRayActor(BasePPORole):
             disable_ds_ckpt=args.disable_ds_ckpt,
             max_time_per_run=args.max_time_per_run,
             buffer_limit=args.buffer_limit,
+            eval_temperature=args.eval_temperature,
         )
 
         # broadcast checkpoint

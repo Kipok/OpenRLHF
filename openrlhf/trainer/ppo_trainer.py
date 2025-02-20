@@ -498,30 +498,34 @@ class PPOTrainer(ABC):
         return status
 
     def evaluate(self, dataloader, global_step, extra_rm_args):
-            eval_buffer = defaultdict(list)
+        eval_buffer = defaultdict(list)
 
-            pbar = tqdm(
-                range(dataloader.__len__()),
-                desc=f"Eval global step [{global_step}]",
-                disable=not self.strategy.is_rank_0(),
-            )
+        pbar = tqdm(
+            range(dataloader.__len__()),
+            desc=f"Eval global step [{global_step}]",
+            disable=not self.strategy.is_rank_0(),
+        )
 
-            eval_generate_kwargs = self.generate_kwargs.copy()
-            # Set greedy sampling for eval
-            eval_generate_kwargs['temperature'] = 0
+        eval_generate_kwargs = self.generate_kwargs.copy()
+        # Set greedy sampling for eval
+        eval_generate_kwargs['temperature'] = self.generate_kwargs['eval_temperature']
 
-            logs_dict = {}
-            for prompts, input_dict in dataloader:
-                for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(extra_rm_args, (prompts, input_dict), **eval_generate_kwargs)
-                ):
-                    eval_buffer['reward'].extend(experience.info['reward'])
-                    pbar.update()
-            rewards = torch.stack(eval_buffer['reward'])
-            rewards = self.strategy.all_gather(rewards)
-            logs_dict['reward'] = rewards.mean().item()
+        logs_dict = {}
+        for prompts, input_dict in dataloader:
+            for i, experience in enumerate(
+                self.experience_maker.make_experience_list(extra_rm_args, (prompts, input_dict), **eval_generate_kwargs)
+            ):
+                for k, v in experience.info.items():
+                    if k.startswith('reward') or k.startswith('metric'):
+                        eval_buffer[k].extend(v)
+                pbar.update()
 
-            return logs_dict
+        for k, v in eval_buffer.items():
+            metrics = torch.stack(eval_buffer[k])
+            metrics = self.strategy.all_gather(metrics)
+            logs_dict[k] = metrics.mean().item()
+
+        return logs_dict
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:

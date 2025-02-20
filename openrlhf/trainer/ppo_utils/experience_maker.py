@@ -342,11 +342,17 @@ class NaiveExperienceMaker(ABC):
 
         info = {
             "kl": masked_mean(kl, action_mask, dim=-1),
-            "reward": r,
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
         }
+
+        if type(r) == dict:
+            assert 'reward' in r
+            info.update(r)
+        else:
+            info['reward'] = r
+
         # reset model state
         self.actor.train()
         if self.critic is not None:
@@ -616,7 +622,16 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             value, rewards = ref_values[0], ref_values[1:]
         if value is not None:
             value = value.to(device)
-        rewards = [r.to(device) for r in rewards]
+
+        reward_metrics = {}
+        if (len(rewards) > 0) and (type(rewards[0]) == dict):
+            for k, v in rewards[0].items():
+                if k == 'reward':
+                    continue
+                reward_metrics[k] = [r[k] for r in rewards]
+                reward_metrics[k] = self.reward_fn(reward_metrics[k])
+
+        rewards = [(r['reward'] if type(r) == dict else r).to(device) for r in rewards]
         r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
 
         # avoid CUDA OOM when colocate models
@@ -657,6 +672,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "total_length": samples.total_length,
             "num_actions": num_actions,
         }
+        info.update(reward_metrics)
 
         if self.strategy.args.perf:
             self.perf_stats["actor_value_rm_time"] += actor_value_rm_time
