@@ -461,7 +461,6 @@ class PPOTrainer(ABC):
                     (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
             elif k.startswith('metric_'):
-                print('YYY1', k, type(v))
                 status[k] = v
             else:
                 status[k] = v.mean().item()
@@ -538,13 +537,7 @@ class PPOTrainer(ABC):
             for i, experience in enumerate(
                 self.experience_maker.make_experience_list(extra_rm_args, (prompts, input_dict), **eval_generate_kwargs)
             ):
-                batch_size = len(experience.sequences)
                 status = {k : v for k, v in experience.info.items() if (k == 'reward') or k.startswith('metric_')}
-                #for k, v in experience.info.items():
-                #    if k.startswith('reward'):
-                #        v = torch.unbind(v)
-                #        assert batch_size == len(v)
-                #    eval_buffer[k].extend(v)
                 status = self.strategy.all_gather(status)
                 for k, v in status.items():
                     if v.shape[0] > 0:
@@ -556,6 +549,7 @@ class PPOTrainer(ABC):
                 metrics = torch.cat(eval_buffer[k])
                 logs_dict[k] = metrics.mean().item()
 
+        print('Eval metrics:', logs_dict)
         return logs_dict
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):

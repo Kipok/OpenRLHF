@@ -511,7 +511,12 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(extra_rm_args, all_prompts, **generate_kwargs)
+        min_samples_per_prompt = self.strategy.args.min_samples_per_prompt
+        if min_samples_per_prompt == 0:
+            experiences = super().make_experience_list(extra_rm_args, all_prompts, **generate_kwargs)
+        else:
+            experiences = self.make_experience_list_iterative(extra_rm_args, all_prompts, **generate_kwargs)
+
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
@@ -834,3 +839,319 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if self.critic is not None:
             ray.get(self._ref)
             self._ref = None
+
+
+    def _iterative_generate_vllm(self, all_prompts: List[Dict], **kwargs) -> List[Experience]:
+        """
+        An iterative version of vLLM generation that uses min_samples_per_prompt,
+        doubles them each iteration, calls self.make_experience to get reward,
+        and uses the "metric_pass@1" field as a binary pass/fail for continuing.
+        Returns a list of Experience objects directly (rather than Samples).
+        """
+        from vllm import SamplingParams
+
+        # CHANGED: We'll parse out min_samples_per_prompt, etc.
+        min_samples_per_prompt = kwargs.get("min_samples_per_prompt", 1)
+        args = self.strategy.args
+        n_samples_per_prompt = args.n_samples_per_prompt
+
+        all_prompts, all_prompt_metadata = all_prompts
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        if len(self.vllm_engines) <= world_size:
+            llms = [self.vllm_engines[rank % len(self.vllm_engines)]]
+        else:
+            llms = self.vllm_engines[rank::world_size]
+
+        sampling_params = SamplingParams(
+            temperature=kwargs.get("temperature", 1.0),
+            top_p=kwargs.get("top_p", 1.0),
+            top_k=kwargs.get("top_k", -1),
+            max_tokens=kwargs.get("max_new_tokens", 1024),
+            min_tokens=kwargs.get("min_new_tokens", 1),
+            skip_special_tokens=kwargs.get("skip_special_tokens", False),
+            include_stop_str_in_output=True,
+        )
+
+        # CHANGED: iterative approach
+        total_generated_for_prompt = [0] * len(all_prompts)
+        P = list(range(len(all_prompts)))  # active prompt indices
+        iteration = 0
+
+        # We'll store a final list of Experience objects
+        all_experiences = []
+
+        while P:
+            # how many has the "worst" prompt in P generated so far?
+            max_generated_for_active = max(total_generated_for_prompt[i] for i in P)
+
+            # current iteration's samples per prompt
+            samples_per_prompt = max(
+                0,
+                min(
+                    n_samples_per_prompt - max_generated_for_active,
+                    min_samples_per_prompt * (2 ** iteration),
+                ),
+            )
+            if samples_per_prompt <= 0:
+                break
+
+            # expand prompts for this iteration
+            iteration_prompts = []
+            iteration_metadata = []
+            prompt_indices_for_this_round = []
+            for i_idx in P:
+                can_do = n_samples_per_prompt - total_generated_for_prompt[i_idx]
+                if can_do > 0:
+                    to_do = min(can_do, samples_per_prompt)
+                    iteration_prompts.extend([all_prompts[i_idx]] * to_do)
+                    iteration_metadata.extend([deepcopy(all_prompt_metadata[i_idx])] * to_do)
+                    prompt_indices_for_this_round.extend([i_idx] * to_do)
+
+            if not iteration_prompts:
+                break
+
+            # Tokenize for vLLM
+            iteration_token_ids = self.tokenize_fn(iteration_prompts, self.prompt_max_len, padding=False)["input_ids"]
+
+            # round-robin distribution to our engines
+            batch_size = (len(iteration_token_ids) + len(llms) - 1) // len(llms)
+            all_output_refs = []
+            for e_i, llm in enumerate(llms):
+                sub_ids = iteration_token_ids[e_i * batch_size : (e_i + 1) * batch_size]
+                if sub_ids:
+                    all_output_refs.append(
+                        llm.generate.remote(sampling_params=sampling_params, prompt_token_ids=sub_ids)
+                    )
+
+            # gather results
+            all_outputs = sum(ray.get(all_output_refs), [])
+
+            # Now we build "Samples" in micro-batches, but immediately convert to Experience
+            # by calling self.make_experience(...) to get the reward.
+            micro_experiences = []
+            out_index = 0
+            for i_out in range(0, len(all_outputs), args.micro_rollout_batch_size):
+                outputs = all_outputs[i_out : i_out + args.micro_rollout_batch_size]
+                cur_prompts = iteration_prompts[i_out : i_out + args.micro_rollout_batch_size]
+                cur_metadata = iteration_metadata[i_out : i_out + args.micro_rollout_batch_size]
+
+                # Build a single Samples object from these outputs (same logic as original),
+                # then pass it to make_experience
+                if not self.packing_samples:
+                    max_input_len, max_output_len = 0, 0
+                    for output in outputs:
+                        max_input_len = max(max_input_len, len(output.prompt_token_ids))
+                        max_output_len = max(max_output_len, len(output.outputs[0].token_ids))
+
+                    pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+                    sequences_list = []
+                    for output in outputs:
+                        input_ids = list(output.prompt_token_ids)
+                        output_ids = list(output.outputs[0].token_ids)
+                        # pad left for input
+                        if len(input_ids) < max_input_len:
+                            input_ids = [pad_token_id] * (max_input_len - len(input_ids)) + input_ids
+                        # pad right for output
+                        if len(output_ids) < max_output_len:
+                            output_ids = output_ids + [pad_token_id] * (max_output_len - len(output_ids))
+                        sequences_list.append(input_ids + output_ids)
+
+                    sequences_tensor = torch.tensor(sequences_list)
+                    (sequences_tensor, attn_mask, act_mask) = self.actor.process_sequences(
+                        sequences_tensor, max_input_len, eos_token_id, pad_token_id
+                    )
+
+                    samples_obj = Samples(
+                        sequences=sequences_tensor.to("cuda"),
+                        attention_mask=attn_mask.to("cuda"),
+                        action_mask=act_mask.to("cuda"),
+                        num_actions=act_mask.size(1),
+                        packed_seq_lens=None,
+                        response_length=act_mask.float().sum(dim=-1),
+                        total_length=attn_mask.float().sum(dim=-1),
+                        prompts=cur_prompts,
+                        prompt_metadata=cur_metadata,
+                    )
+                else:
+                    # packing path (not fully tested in the example)
+                    pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+                    seqs = []
+                    lens = []
+                    attention_ids = []
+                    num_actions = []
+                    for idx2, output in enumerate(outputs):
+                        in_len = len(output.prompt_token_ids)
+                        out_len = len(output.outputs[0].token_ids)
+                        seqs.extend(output.prompt_token_ids + list(output.outputs[0].token_ids))
+                        lens.append(in_len + out_len)
+                        attention_ids.extend([idx2 + 1] * (in_len + out_len))
+                        num_actions.append(max(1, out_len))
+
+                    sequences_tensor = torch.tensor(seqs, device="cuda").unsqueeze(0)
+                    attention_mask_tensor = torch.tensor(attention_ids, device="cuda").unsqueeze(0)
+                    response_length = torch.tensor(num_actions, device="cuda", dtype=torch.float)
+                    total_length = torch.tensor(lens, device="cuda", dtype=torch.float)
+
+                    samples_obj = Samples(
+                        sequences=sequences_tensor,
+                        attention_mask=attention_mask_tensor,
+                        action_mask=None,
+                        num_actions=num_actions,
+                        packed_seq_lens=torch.tensor(lens, device="cuda"),
+                        response_length=response_length,
+                        total_length=total_length,
+                        prompts=cur_prompts,
+                        prompt_metadata=cur_metadata,
+                    )
+
+                # Now call make_experience to get the reward & Experience
+                exp = self.make_experience(kwargs.get("extra_rm_args", {}), samples_obj)
+                micro_experiences.append(exp)
+
+            # We now have a list of Experience objects (micro_experiences).
+            # We must check which prompts had zero reward *across all newly generated samples*.
+            # Collect rewards in the same index order as prompt_indices_for_this_round.
+            # The iteration outputs are in the same order as iteration_prompts, so we match them 1:1.
+
+            # Flatten experiences to get reward in the same order
+            # (each micro-batch in micro_experiences is a chunk of them).
+            iteration_exps_flat = []
+            for me in micro_experiences:
+                iteration_exps_flat.append(me)
+            # Each Experience has a batch dimension in sequences, so we can match them 1-by-1 or do one big batch.
+            # For simplicity, we do it 1-by-1, assuming micro-batch sizes are small.
+
+            # We need to break them into single elements if the micro-batch size > 1.
+            # In the naive code, each "Experience" can be a batch. If batch_size>1, we have multiple rows of reward.
+            # We'll handle them row by row:
+            expanded_exps = []
+            for e in iteration_exps_flat:
+                seqs = e.sequences
+                if seqs.dim() == 2:
+                    batch_sz = seqs.size(0)
+                    # slice row-by-row
+                    for row_i in range(batch_sz):
+                        single_exp = Experience(
+                            sequences=seqs[row_i : row_i + 1],
+                            action_log_probs=e.action_log_probs[row_i : row_i + 1] if e.action_log_probs is not None else None,
+                            values=e.values[row_i : row_i + 1] if e.values is not None else None,
+                            returns=None,
+                            advantages=None,
+                            attention_mask=e.attention_mask[row_i : row_i + 1] if e.attention_mask is not None else None,
+                            action_mask=e.action_mask[row_i : row_i + 1] if e.action_mask is not None else None,
+                            info={k: (v[row_i] if isinstance(v, torch.Tensor) and v.dim() > 0 else v)
+                                  for k, v in e.info.items()},
+                            kl=e.kl[row_i : row_i + 1] if e.kl is not None else None,
+                        )
+                        expanded_exps.append(single_exp)
+                else:
+                    expanded_exps.append(e)
+
+            # Now expanded_exps should line up exactly with iteration_prompts in order
+            # We'll accumulate them in all_experiences
+            all_experiences.extend(expanded_exps)
+
+            # Summaries of reward 0 or not
+            # We find the chunk of expanded_exps that belongs to each prompt in this iteration
+            # Then sum their rewards. If sum is 0, keep the prompt in P.
+            # Otherwise remove it from P.
+
+            idx_offset = 0
+            new_P = []
+            for i_idx in P:
+                can_do = n_samples_per_prompt - total_generated_for_prompt[i_idx]
+                # how many we actually generated for i_idx
+                to_do = min(can_do, samples_per_prompt)
+                if to_do <= 0:
+                    # might have been 0 if n_samples_per_prompt was already reached
+                    continue
+
+                # rewards for these 'to_do' expansions
+                sub_exps = expanded_exps[idx_offset : idx_offset + to_do]
+                idx_offset += to_do
+
+                # Each sub_exp has info["reward"], which is a 1D shape with 1 element (we forced row-wise).
+                sum_reward = sum(e.info["metric_pass@1"].item() for e in sub_exps)
+                # update the total gen
+                total_generated_for_prompt[i_idx] += to_do
+
+                # if sum_reward == 0, we keep going if we haven't hit the max
+                if (sum_reward == 0) and (total_generated_for_prompt[i_idx] < n_samples_per_prompt):
+                    new_P.append(i_idx)
+
+            P = new_P
+            iteration += 1
+
+        # Return all_experiences from all iterations
+        return all_experiences
+
+    # ADDED: a new specialized method that does advantage calculation after the iterative experiences
+    @torch.no_grad()
+    def make_experience_list_iterative(self, extra_rm_args, all_prompts: Union[Dict, List[Dict]], **generate_kwargs) -> List[Experience]:
+        """
+        This is the new pipeline for vLLM iterative generation. We call our replaced
+        _iterative_generate_vllm (which returns Experience objects directly, each with reward already set).
+        Then we do advantage calculations and return them.
+        """
+        # ADDED: ensure we are indeed in vLLM mode
+        if self.vllm_engines is None:
+            raise AssertionError("make_experience_list_iterative called but vllm_engines is None!")
+
+        # ADDED: pass extra_rm_args into _generate_vllm
+        generate_kwargs["extra_rm_args"] = extra_rm_args
+
+        # Step 1: do iterative generation, collecting Experience objects
+        experiences = self._iterative_generate_vllm(all_prompts, **generate_kwargs)
+
+        # Step 2: process experiences (maybe RLOO or normal)
+        experiences, rewards = self.process_experiences(experiences)
+
+        # Step 3: advantage calc
+        args = self.strategy.args
+        for experience, reward in zip(experiences, rewards):
+            experience = experience.to_device("cuda")
+            reward = reward.to(device="cuda")
+            num_actions = experience.info["num_actions"]
+            reward = compute_reward(
+                reward,
+                self.kl_ctl.value,
+                experience.kl,
+                action_mask=experience.action_mask,
+                num_actions=num_actions,
+                reward_clip_range=args.reward_clip_range,
+            )
+
+            if self.advantage_estimator == "gae":
+                experience.advantages, experience.returns = self.get_advantages_and_returns(
+                    experience.values,
+                    reward,
+                    experience.action_mask,
+                    generate_kwargs["gamma"],
+                    generate_kwargs["lambd"],
+                )
+            elif self.advantage_estimator in ["reinforce", "rloo"]:
+                experience.returns = self.get_cumulative_returns(
+                    reward,
+                    experience.action_mask,
+                    generate_kwargs["gamma"],
+                )
+                experience.advantages = deepcopy(experience.returns)
+            else:
+                raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
+
+            # calculate the return info.
+            if not getattr(self, "packing_samples", False):
+                return_sums = reward.sum(dim=-1)
+            else:
+                return_sums = torch.tensor(
+                    [each_reward.sum() for each_reward in reward], device=torch.cuda.current_device()
+                )
+            experience.info["return"] = return_sums
+            # remove unnecessary info
+            experience.kl = None
+            del experience.info["num_actions"]
+            experience.to_device("cpu")
+
+        return experiences

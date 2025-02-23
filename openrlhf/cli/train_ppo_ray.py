@@ -289,6 +289,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_samples_per_prompt", type=int, default=1, help="number of responses for each prompt in generation"
     )
+    parser.add_argument(
+        "--min_samples_per_prompt", 
+        type=int, 
+        default=0, 
+        help="minimum number of responses for each prompt in a single iterative generation. 0 means non-iterative generation"
+    )
     parser.add_argument("--save_value_network", action="store_true", default=False, help="Save critic model")
     parser.add_argument("--actor_learning_rate", type=float, default=1e-6)
     parser.add_argument("--critic_learning_rate", type=float, default=9e-6)
